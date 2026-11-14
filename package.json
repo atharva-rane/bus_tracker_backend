@@ -1,2 +1,2 @@
 {"name":"poll-backend","version":"1.0.0","type":"module","engines":{"node":">=22"},"scripts":{"start":"node server.js","dev":"node --watch --env-file=.env server.js"},
-"dependencies":{"bcryptjs":"^2.4.3","cors":"^2.8.5","express":"^4.21.0","jsonwebtoken":"^9.0.2","pg":"^8.13.0"}}
+"dependencies":{"bcryptjs":"^2.4.3","cors":"^2.8.5","express":"^4.21.0","jsonwebtoken":"^9.0.2","pg":"^8.13.0","ws":"^8.18.0"}}
