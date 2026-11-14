@@ -2,9 +2,9 @@ import http from 'http'; import crypto from 'crypto'; import { promisify } from 
 import express from 'express'; import cors from 'cors'; import pg from 'pg';
 import jwt from 'jsonwebtoken'; import bcrypt from 'bcryptjs';
 import path from 'path'; import fs from 'fs'; import { fileURLToPath } from 'url';
-const { DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS, PORT = 3000, CORS_ORIGIN } = process.env;
+const { DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS, PORT = 3000, CORS_ORIGIN } = process.env, SERVERLESS = !!process.env.VERCEL;   // on Vercel: no WebSockets, clients poll instead
 if (!DATABASE_URL || !JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) throw new Error('Set DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS');
-const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 20, connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000, ssl: /@(localhost|127\.0\.0\.1)/.test(DATABASE_URL) ? false : { rejectUnauthorized: false } });
+const pool = new pg.Pool({ connectionString: DATABASE_URL, max: SERVERLESS ? 3 : 20, connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000, ssl: /@(localhost|127\.0\.0\.1)/.test(DATABASE_URL) ? false : { rejectUnauthorized: false } });
 pool.on('error', e => console.error('pg', e.message));
 const q = (s, p) => pool.query(s, p).then(r => r.rows);
 await q(`CREATE TABLE IF NOT EXISTS polls(id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, active BOOLEAN DEFAULT FALSE);
@@ -55,7 +55,7 @@ wss.on('connection', (ws, req) => {
   try { jwt.verify(new URL(req.url, 'http://x').searchParams.get('token'), JWT_SECRET); } catch { return ws.close(4401); }
   ws.alive = true; ws.on('pong', () => ws.alive = true); ws.on('error', () => {}); clients.add(ws); ws.on('close', () => clients.delete(ws));
 });
-setInterval(() => clients.forEach(ws => { if (!ws.alive) return ws.terminate(); ws.alive = false; ws.ping(); }), 25000);
+if (!SERVERLESS) setInterval(() => clients.forEach(ws => { if (!ws.alive) return ws.terminate(); ws.alive = false; ws.ping(); }), 25000);
 let ver = 0, cache = null;
 const push = (ev, data = {}) => { if (ev === 'state') ver++; const m = JSON.stringify({ ev, data }); clients.forEach(c => c.readyState === 1 && c.send(m)); };
 
@@ -69,11 +69,11 @@ app.post('/api/login', h(async (req, res) => {
 
 // one shared, versioned snapshot: 50 clients refreshing at once cost one DB round trip
 const snapshot = () => {
-  if (cache && cache.v === ver) return cache.p;
+  if (cache && cache.v === ver && (!SERVERLESS || Date.now() - cache.t < 800)) return cache.p;   // serverless: instances don't share `ver`, so keep the cache very short
   const v = ver, p = Promise.all([
     q('SELECT id,name,username,active FROM polls ORDER BY id'), q('SELECT id,poll_id,label,pos,is_pickup,direction FROM records ORDER BY pos,id'), q('SELECT id,direction,label,pos,is_pickup FROM route_spots ORDER BY pos,id'),
     q(`SELECT id,poll_id,to_char(date,'YYYY-MM-DD') date,source,destination,direction,status,current_record_id,reached_at FROM journeys ORDER BY date,id`)]);
-  cache = { v, p }; p.catch(() => { if (cache?.p === p) cache = null; }); return p;
+  cache = { v, p, t: Date.now() }; p.catch(() => { if (cache?.p === p) cache = null; }); return p;
 };
 app.get('/api/state', auth, h(async (req, res) => {
   const [polls, records, tpl, journeys] = await snapshot(), adm = req.user.role === 'admin';
@@ -256,4 +256,5 @@ app.delete('/api/messages/:id', auth, h(async (req, res) => {
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), '../frontend/dist/browser');
 if (fs.existsSync(dist)) { app.use(express.static(dist, { maxAge: '1h' })); app.get(/^\/(?!api).*/, (_, res) => res.sendFile(path.join(dist, 'index.html'))); }   // single-server mode only
 app.get('/', (_, res) => res.send('Bus Tracker API is running'));
-server.listen(PORT, () => console.log('Poll running on :' + PORT));
+if (!SERVERLESS) server.listen(PORT, () => console.log('Poll running on :' + PORT));
+export default app;   // Vercel runs this Express app as a function
