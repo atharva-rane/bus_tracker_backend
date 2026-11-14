@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS messages(id SERIAL PRIMARY KEY, sender TEXT NOT NULL,
 ALTER TABLE journeys ADD COLUMN IF NOT EXISTS reached_at TIMESTAMPTZ;
 ALTER TABLE records ADD COLUMN IF NOT EXISTS is_pickup BOOLEAN DEFAULT FALSE;
 ALTER TABLE records ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'onward';
+ALTER TABLE polls ADD COLUMN IF NOT EXISTS active_onward BOOLEAN;
+ALTER TABLE polls ADD COLUMN IF NOT EXISTS active_return BOOLEAN;
+UPDATE polls SET active_onward=COALESCE(active_onward,active,FALSE), active_return=COALESCE(active_return,active,FALSE) WHERE active_onward IS NULL OR active_return IS NULL;
+ALTER TABLE polls ALTER COLUMN active_onward SET DEFAULT FALSE;
+ALTER TABLE polls ALTER COLUMN active_return SET DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS route_spots(id SERIAL PRIMARY KEY, direction TEXT NOT NULL, label TEXT NOT NULL, pos INT NOT NULL DEFAULT 0, is_pickup BOOLEAN DEFAULT FALSE);
 CREATE INDEX IF NOT EXISTS r_poll ON records(poll_id,pos); CREATE INDEX IF NOT EXISTS j_poll ON journeys(poll_id,date);`;
 // retries on the next request if it failed (a cold or sleeping database no longer breaks the instance until it restarts)
@@ -91,12 +96,9 @@ app.use((req, res, next) =>
 
 const h = (f) => (req, res) =>
   f(req, res).catch((e) =>
-    res
-      .status(e.code === "23505" ? 409 : 500)
-      .json({
-        error:
-          e.code === "23505" ? "Name or username already exists" : e.message,
-      }),
+    res.status(e.code === "23505" ? 409 : 500).json({
+      error: e.code === "23505" ? "Name or username already exists" : e.message,
+    }),
   );
 const auth = (req, res, next) => {
   try {
@@ -182,6 +184,9 @@ const spotsFor = async (c, id, dir) => {
     ).rows.reverse();
   return rows;
 };
+// activation is per journey direction: a bus can be live for its onward trip but switched off for the return trip (or vice versa)
+const dirOf = (d) => (d === "return" ? "return" : "onward"),
+  actCol = (d) => (dirOf(d) === "return" ? "active_return" : "active_onward");
 const sign = (u) => jwt.sign(u, JWT_SECRET, { expiresIn: "12h" });
 
 // live updates over WebSocket (not limited by the browser's 6-connections-per-site cap, unlike SSE)
@@ -244,7 +249,9 @@ const snapshot = () => {
     return cache.p; // serverless: instances don't share `ver`, so keep the cache very short
   const v = ver,
     p = Promise.all([
-      q("SELECT id,name,username,active FROM polls ORDER BY id"),
+      q(
+        "SELECT id,name,username,active,active_onward,active_return FROM polls ORDER BY id",
+      ),
       q(
         "SELECT id,poll_id,label,pos,is_pickup,direction FROM records ORDER BY pos,id",
       ),
@@ -313,10 +320,17 @@ app.post(
   auth,
   admin,
   h(async (req, res) => {
-    await q("UPDATE polls SET active=$2 WHERE id=ANY($1::int[])", [
-      (req.body.ids || []).map(Number),
-      !!req.body.active,
-    ]);
+    // direction "onward" / "return" switches just that trip type; omitted = both
+    const d = req.body.direction,
+      set = d ? `${actCol(d)}=$2` : "active_onward=$2,active_return=$2";
+    await q(
+      `UPDATE polls SET ${set}, active=${
+        d
+          ? `(${d === "return" ? "active_onward" : "$2"} OR ${d === "return" ? "$2" : "active_return"})`
+          : "$2"
+      } WHERE id=ANY($1::int[])`,
+      [(req.body.ids || []).map(Number), !!req.body.active],
+    );
     push("state");
     res.json({ ok: 1 });
   }),
@@ -328,7 +342,7 @@ app.put(
   h(async (req, res) => {
     const { name, username, password, active } = req.body;
     await q(
-      "UPDATE polls SET name=COALESCE($2,name),username=COALESCE($3,username),password_hash=COALESCE($4,password_hash),active=COALESCE($5,active) WHERE id=$1",
+      "UPDATE polls SET name=COALESCE($2,name),username=COALESCE($3,username),password_hash=COALESCE($4,password_hash),active=COALESCE($5,active),active_onward=COALESCE($5,active_onward),active_return=COALESCE($5,active_return) WHERE id=$1",
       [
         req.params.id,
         name,
@@ -578,19 +592,32 @@ app.post(
       const {
         rows: [pl],
       } = await c.query(
-        "SELECT name,active,(SELECT count(*)::int FROM records WHERE poll_id=$1) n FROM polls WHERE id=$1",
+        "SELECT name,active_onward,active_return,(SELECT count(*)::int FROM records WHERE poll_id=$1) n FROM polls WHERE id=$1",
         [id],
       );
       const {
         rows: [on],
       } = await c.query(
-        `SELECT id FROM journeys WHERE poll_id=$1 AND status='active'`,
+        `SELECT id,direction FROM journeys WHERE poll_id=$1 AND status='active'`,
         [id],
       );
-      if (req.user.role !== "admin" && !pl?.active)
+      // the journey this tap would start (same ordering as the UPDATE below)
+      const {
+        rows: [nx],
+      } = await c.query(
+        `SELECT direction FROM journeys WHERE poll_id=$1 AND status='planned' ORDER BY date,id LIMIT 1`,
+        [id],
+      );
+      const jd = (on || nx)?.direction,
+        isOn = jd
+          ? !!pl?.[actCol(jd)]
+          : !!(pl?.active_onward || pl?.active_return);
+      if (req.user.role !== "admin" && !isOn)
         out = [
           403,
-          { error: "This bus is deactivated. Ask the admin to activate it." },
+          {
+            error: `This bus is deactivated for the ${dirOf(jd)} journey. Ask the admin to activate it.`,
+          },
         ];
       else if (!pl?.n)
         out = [
@@ -645,26 +672,28 @@ app.post(
       return res
         .status(403)
         .json({ error: "You can only complete your own bus" });
-    if (
-      req.user.role !== "admin" &&
-      !(await q("SELECT 1 FROM polls WHERE id=$1 AND active", [id])).length
-    )
-      return res
-        .status(403)
-        .json({ error: "This bus is deactivated by the admin." });
     const [j] = await q(
       `SELECT j.id,j.source,j.destination,j.direction,j.current_record_id,p.name FROM journeys j JOIN polls p ON p.id=j.poll_id WHERE j.poll_id=$1 AND j.status='active' LIMIT 1`,
       [id],
     );
     if (!j) return res.json({ ok: 1, same: true });
+    if (
+      req.user.role !== "admin" &&
+      !(
+        await q(`SELECT 1 FROM polls WHERE id=$1 AND ${actCol(j.direction)}`, [
+          id,
+        ])
+      ).length
+    )
+      return res.status(403).json({
+        error: `This bus is deactivated for the ${dirOf(j.direction)} journey.`,
+      });
     const rs = await spotsFor(pool, id, j.direction);
     if (!rs.length || rs[rs.length - 1].id !== j.current_record_id)
-      return res
-        .status(400)
-        .json({
-          error:
-            "Tick every spot, up to the last one, before completing the journey",
-        });
+      return res.status(400).json({
+        error:
+          "Tick every spot, up to the last one, before completing the journey",
+      });
     if (
       !(
         await q(
@@ -712,10 +741,19 @@ app.post(
         out = [400, { error: "No active journey. Start the journey first." }];
       else if (
         req.user.role !== "admin" &&
-        !(await c.query("SELECT 1 FROM polls WHERE id=$1 AND active", [id]))
-          .rows.length
+        !(
+          await c.query(
+            `SELECT 1 FROM polls WHERE id=$1 AND ${actCol(j.direction)}`,
+            [id],
+          )
+        ).rows.length
       )
-        out = [403, { error: "This bus is deactivated by the admin." }];
+        out = [
+          403,
+          {
+            error: `This bus is deactivated for the ${dirOf(j.direction)} journey.`,
+          },
+        ];
       else {
         const rs = await spotsFor(c, id, j.direction);
         const cur = rs.findIndex((r) => r.id === j.current_record_id),
