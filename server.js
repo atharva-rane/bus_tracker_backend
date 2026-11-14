@@ -35,8 +35,7 @@ const q = (s, p) => pool.query(s, p).then((r) => r.rows);
 
 // FIX 2: no top-level await. If the DB is unreachable, requests get a JSON error (with CORS headers)
 // instead of the whole function crashing and the browser reporting a fake "CORS error".
-const ready =
-  q(`CREATE TABLE IF NOT EXISTS polls(id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, active BOOLEAN DEFAULT FALSE);
+const INIT_SQL = `CREATE TABLE IF NOT EXISTS polls(id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, active BOOLEAN DEFAULT FALSE);
 CREATE TABLE IF NOT EXISTS records(id SERIAL PRIMARY KEY, poll_id INT REFERENCES polls ON DELETE CASCADE, label TEXT NOT NULL, pos INT NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS journeys(id SERIAL PRIMARY KEY, poll_id INT REFERENCES polls ON DELETE CASCADE, date DATE NOT NULL, source TEXT, destination TEXT, direction TEXT DEFAULT 'onward', status TEXT DEFAULT 'planned', current_record_id INT REFERENCES records ON DELETE SET NULL);
 CREATE TABLE IF NOT EXISTS messages(id SERIAL PRIMARY KEY, sender TEXT NOT NULL, sender_key TEXT NOT NULL, body TEXT NOT NULL, edited BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT now());
@@ -44,8 +43,16 @@ ALTER TABLE journeys ADD COLUMN IF NOT EXISTS reached_at TIMESTAMPTZ;
 ALTER TABLE records ADD COLUMN IF NOT EXISTS is_pickup BOOLEAN DEFAULT FALSE;
 ALTER TABLE records ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'onward';
 CREATE TABLE IF NOT EXISTS route_spots(id SERIAL PRIMARY KEY, direction TEXT NOT NULL, label TEXT NOT NULL, pos INT NOT NULL DEFAULT 0, is_pickup BOOLEAN DEFAULT FALSE);
-CREATE INDEX IF NOT EXISTS r_poll ON records(poll_id,pos); CREATE INDEX IF NOT EXISTS j_poll ON journeys(poll_id,date);`);
-ready.catch((e) => console.error("db init failed:", e.message)); // log it; avoids an unhandled-rejection crash
+CREATE INDEX IF NOT EXISTS r_poll ON records(poll_id,pos); CREATE INDEX IF NOT EXISTS j_poll ON journeys(poll_id,date);`;
+// retries on the next request if it failed (a cold or sleeping database no longer breaks the instance until it restarts)
+let ready = null;
+const initDb = () =>
+  (ready ||= q(INIT_SQL).catch((e) => {
+    ready = null;
+    console.error("db init failed:", e.message);
+    throw e;
+  }));
+initDb().catch(() => {}); // warm up at startup; the error is already logged
 
 const app = express();
 
@@ -75,7 +82,7 @@ app.use(
 app.use(express.json({ limit: "2mb" }));
 // runs after CORS, so even a DB failure reaches the browser as a readable JSON error
 app.use((req, res, next) =>
-  ready.then(
+  initDb().then(
     () => next(),
     (e) =>
       res.status(500).json({ error: "Database init failed: " + e.message }),
