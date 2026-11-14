@@ -1,8 +1,8 @@
 import http from 'http'; import crypto from 'crypto'; import { promisify } from 'util'; import { WebSocketServer } from 'ws';
 import express from 'express'; import cors from 'cors'; import pg from 'pg';
 import jwt from 'jsonwebtoken'; import bcrypt from 'bcryptjs';
-import path from 'path'; import { fileURLToPath } from 'url';
-const { DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS, PORT = 3000 } = process.env;
+import path from 'path'; import fs from 'fs'; import { fileURLToPath } from 'url';
+const { DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS, PORT = 3000, CORS_ORIGIN } = process.env;
 if (!DATABASE_URL || !JWT_SECRET || !ADMIN_USER || !ADMIN_PASS) throw new Error('Set DATABASE_URL, JWT_SECRET, ADMIN_USER, ADMIN_PASS');
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 20, connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000, ssl: /@(localhost|127\.0\.0\.1)/.test(DATABASE_URL) ? false : { rejectUnauthorized: false } });
 pool.on('error', e => console.error('pg', e.message));
@@ -17,7 +17,7 @@ ALTER TABLE records ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'on
 CREATE TABLE IF NOT EXISTS route_spots(id SERIAL PRIMARY KEY, direction TEXT NOT NULL, label TEXT NOT NULL, pos INT NOT NULL DEFAULT 0, is_pickup BOOLEAN DEFAULT FALSE);
 CREATE INDEX IF NOT EXISTS r_poll ON records(poll_id,pos); CREATE INDEX IF NOT EXISTS j_poll ON journeys(poll_id,date);`);
 
-const app = express(); app.use(cors(), express.json({ limit: '2mb' }));
+const app = express(); app.use(cors(CORS_ORIGIN ? { origin: CORS_ORIGIN.split(',').map(s => s.trim().replace(/\/+$/, '')) } : undefined), express.json({ limit: '2mb' }));
 const h = f => (req, res) => f(req, res).catch(e => res.status(e.code === '23505' ? 409 : 500).json({ error: e.code === '23505' ? 'Name or username already exists' : e.message }));
 const auth = (req, res, next) => { try { req.user = jwt.verify((req.headers.authorization || '').slice(7) || req.query.token, JWT_SECRET); next(); } catch { res.status(401).json({ error: 'Please sign in' }); } };
 const admin = (req, res, next) => req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admin only' });
@@ -254,5 +254,6 @@ app.delete('/api/messages/:id', auth, h(async (req, res) => {
 }));
 
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), '../frontend/dist/browser');
-app.use(express.static(dist, { maxAge: '1h' })); app.get(/^\/(?!api).*/, (_, res) => res.sendFile(path.join(dist, 'index.html')));
+if (fs.existsSync(dist)) { app.use(express.static(dist, { maxAge: '1h' })); app.get(/^\/(?!api).*/, (_, res) => res.sendFile(path.join(dist, 'index.html'))); }   // single-server mode only
+app.get('/', (_, res) => res.send('Bus Tracker API is running'));
 server.listen(PORT, () => console.log('Poll running on :' + PORT));
